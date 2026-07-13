@@ -69,9 +69,9 @@ func TestOpenAIHandleErrorResponse_NoRuleKeepsDefault(t *testing.T) {
 	c, _ := gin.CreateTestContext(rec)
 
 	svc := &OpenAIGatewayService{}
-	respBody := []byte(`{"error":{"message":"Invalid schema for field messages"}}`)
+	respBody := []byte(`{"error":{"message":"internal upstream failure"}}`)
 	resp := &http.Response{
-		StatusCode: http.StatusUnprocessableEntity,
+		StatusCode: http.StatusNotImplemented,
 		Body:       io.NopCloser(bytes.NewReader(respBody)),
 		Header:     http.Header{},
 	}
@@ -87,6 +87,75 @@ func TestOpenAIHandleErrorResponse_NoRuleKeepsDefault(t *testing.T) {
 	require.True(t, ok)
 	assert.Equal(t, "upstream_error", errField["type"])
 	assert.Equal(t, "Upstream request failed", errField["message"])
+}
+
+func TestOpenAIHandleErrorResponse_RequestShaped4xxPassesThrough(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	tests := []struct {
+		name        string
+		status      int
+		body        string
+		wantType    string
+		wantMessage string
+	}{
+		{
+			name:        "422 invalid schema keeps status and message",
+			status:      http.StatusUnprocessableEntity,
+			body:        `{"error":{"message":"Invalid schema for field messages"}}`,
+			wantType:    "invalid_request_error",
+			wantMessage: "Invalid schema for field messages",
+		},
+		{
+			name:        "400 plan gated model keeps status and message",
+			status:      http.StatusBadRequest,
+			body:        `{"detail":"The 'gpt-5.6-sol' model is not supported when using Codex with a ChatGPT account."}`,
+			wantType:    "invalid_request_error",
+			wantMessage: "The 'gpt-5.6-sol' model is not supported when using Codex with a ChatGPT account.",
+		},
+		{
+			name:        "404 unknown previous response maps to not_found_error",
+			status:      http.StatusNotFound,
+			body:        `{"error":{"message":"Previous response not found"}}`,
+			wantType:    "not_found_error",
+			wantMessage: "Previous response not found",
+		},
+		{
+			name:        "400 empty body falls back to generic message",
+			status:      http.StatusBadRequest,
+			body:        ``,
+			wantType:    "invalid_request_error",
+			wantMessage: OpenAIUpstreamRequestErrorFallbackMessage,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(rec)
+
+			svc := &OpenAIGatewayService{}
+			resp := &http.Response{
+				StatusCode: tt.status,
+				Body:       io.NopCloser(bytes.NewReader([]byte(tt.body))),
+				Header:     http.Header{},
+			}
+			account := &Account{ID: 12, Platform: PlatformOpenAI, Type: AccountTypeAPIKey}
+
+			_, err := svc.handleErrorResponse(context.Background(), resp, c, account, nil)
+			require.Error(t, err)
+			var failoverErr *UpstreamFailoverError
+			require.False(t, errors.As(err, &failoverErr), "request-shaped 4xx must not fail over")
+			assert.Equal(t, tt.status, rec.Code)
+
+			var payload map[string]any
+			require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &payload))
+			errField, ok := payload["error"].(map[string]any)
+			require.True(t, ok)
+			assert.Equal(t, tt.wantType, errField["type"])
+			assert.Equal(t, tt.wantMessage, errField["message"])
+		})
+	}
 }
 
 func TestOpenAIHandleErrorResponse_ContextWindow502KeepsMessageWithoutFailover(t *testing.T) {
@@ -379,4 +448,29 @@ func newNonFailoverPassthroughRule(statusCode int, keyword string, respCode int,
 		PassthroughBody: false,
 		CustomMessage:   &customMessage,
 	}
+}
+
+func TestOpenAIHandleErrorResponse_Transient400StaysRetryable502(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+
+	svc := &OpenAIGatewayService{}
+	respBody := []byte(`{"error":{"code":"server_is_overloaded","message":"The server is currently overloaded"}}`)
+	resp := &http.Response{
+		StatusCode: http.StatusBadRequest,
+		Body:       io.NopCloser(bytes.NewReader(respBody)),
+		Header:     http.Header{},
+	}
+	account := &Account{ID: 15, Platform: PlatformOpenAI, Type: AccountTypeAPIKey}
+
+	_, err := svc.handleErrorResponse(context.Background(), resp, c, account, nil)
+	require.Error(t, err)
+	assert.Equal(t, http.StatusBadGateway, rec.Code, "transient overload on a 400 status must stay retryable")
+
+	var payload map[string]any
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &payload))
+	errField, ok := payload["error"].(map[string]any)
+	require.True(t, ok)
+	assert.Equal(t, "upstream_error", errField["type"])
 }

@@ -432,9 +432,23 @@ func (s *OpenAIGatewayService) handleErrorResponse(
 		errType = "rate_limit_error"
 		errMsg = "Upstream rate limit exceeded, please retry later"
 	default:
-		statusCode = http.StatusBadGateway
-		errType = "upstream_error"
-		errMsg = "Upstream request failed"
+		if ShouldPassthroughOpenAIUpstreamRequestError(resp.StatusCode, body) {
+			// Deterministic request-shaped 4xx: pass the status through with
+			// the sanitized upstream message so clients stop retrying and can
+			// act on the real cause (mirrors handleCompatErrorResponse).
+			// Transient overloads and account-shaped errors riding a 4xx
+			// status keep the retryable, opaque 502.
+			statusCode = resp.StatusCode
+			errType = OpenAIUpstreamRequestErrorType(resp.StatusCode)
+			errMsg = upstreamMsg
+			if errMsg == "" {
+				errMsg = OpenAIUpstreamRequestErrorFallbackMessage
+			}
+		} else {
+			statusCode = http.StatusBadGateway
+			errType = "upstream_error"
+			errMsg = "Upstream request failed"
+		}
 	}
 	if isOpenAIContextWindowError(upstreamMsg, body) && upstreamMsg != "" {
 		errMsg = upstreamMsg

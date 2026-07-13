@@ -1812,3 +1812,148 @@ data: {"type":"response.failed","error":{"message":"This content was flagged"}}
 		require.False(t, openAIForwardErrorAlreadyCommunicated(c, c.Writer.Size(), errors.New("openai cyber_policy: blocked")))
 	})
 }
+
+func TestOpenAIMapUpstreamError_RequestShaped4xxPassthrough(t *testing.T) {
+	h := &OpenAIGatewayHandler{}
+
+	tests := []struct {
+		name       string
+		statusCode int
+		wantStatus int
+		wantType   string
+	}{
+		{name: "400 passes through", statusCode: 400, wantStatus: 400, wantType: "invalid_request_error"},
+		{name: "404 passes through as not_found", statusCode: 404, wantStatus: 404, wantType: "not_found_error"},
+		{name: "409 stays 502 (time-dependent conflict)", statusCode: 409, wantStatus: 502, wantType: "upstream_error"},
+		{name: "413 passes through", statusCode: 413, wantStatus: 413, wantType: "invalid_request_error"},
+		{name: "422 passes through", statusCode: 422, wantStatus: 422, wantType: "invalid_request_error"},
+		{name: "401 stays 502", statusCode: 401, wantStatus: 502, wantType: "upstream_error"},
+		{name: "403 stays 502", statusCode: 403, wantStatus: 502, wantType: "upstream_error"},
+		{name: "429 stays 429", statusCode: 429, wantStatus: 429, wantType: "rate_limit_error"},
+		{name: "500 stays 502", statusCode: 500, wantStatus: 502, wantType: "upstream_error"},
+		{name: "unknown stays 502", statusCode: 418, wantStatus: 502, wantType: "upstream_error"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			status, errType, errMsg := h.mapUpstreamError(tt.statusCode)
+			assert.Equal(t, tt.wantStatus, status)
+			assert.Equal(t, tt.wantType, errType)
+			assert.NotEmpty(t, errMsg)
+		})
+	}
+}
+
+func TestOpenAIHandleFailoverExhausted_RequestShaped4xxKeepsUpstreamMessage(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+
+	h := &OpenAIGatewayHandler{}
+	h.handleFailoverExhausted(c, &service.UpstreamFailoverError{
+		StatusCode:   400,
+		ResponseBody: []byte(`{"detail":"The 'gpt-5.6-sol' model is not supported when using Codex with a ChatGPT account."}`),
+	}, false)
+
+	require.Equal(t, http.StatusBadRequest, w.Code)
+	var parsed map[string]any
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &parsed))
+	errorObj, ok := parsed["error"].(map[string]any)
+	require.True(t, ok)
+	assert.Equal(t, "invalid_request_error", errorObj["type"])
+	assert.Equal(t, "The 'gpt-5.6-sol' model is not supported when using Codex with a ChatGPT account.", errorObj["message"])
+}
+
+func TestOpenAIHandleFailoverExhausted_401StillMapsTo502(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+
+	h := &OpenAIGatewayHandler{}
+	h.handleFailoverExhausted(c, &service.UpstreamFailoverError{
+		StatusCode:   401,
+		ResponseBody: []byte(`{"error":{"message":"invalid bearer token"}}`),
+	}, false)
+
+	require.Equal(t, http.StatusBadGateway, w.Code)
+	var parsed map[string]any
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &parsed))
+	errorObj, ok := parsed["error"].(map[string]any)
+	require.True(t, ok)
+	assert.Equal(t, "upstream_error", errorObj["type"])
+	assert.Equal(t, "Upstream authentication failed, please contact administrator", errorObj["message"])
+}
+
+func TestOpenAIHandleFailoverExhausted_Transient400StaysRetryable(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+
+	h := &OpenAIGatewayHandler{}
+	h.handleFailoverExhausted(c, &service.UpstreamFailoverError{
+		StatusCode:   400,
+		ResponseBody: []byte(`{"error":{"code":"server_is_overloaded","message":"The server is currently overloaded"}}`),
+	}, false)
+
+	require.Equal(t, http.StatusBadGateway, w.Code, "transient overload on a 400 status must stay retryable")
+	var parsed map[string]any
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &parsed))
+	errorObj, ok := parsed["error"].(map[string]any)
+	require.True(t, ok)
+	assert.Equal(t, "upstream_error", errorObj["type"])
+}
+
+func TestOpenAIHandleAnthropicFailoverExhausted_RequestShaped4xxKeepsUpstreamMessage(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+
+	h := &OpenAIGatewayHandler{}
+	h.handleAnthropicFailoverExhausted(c, &service.UpstreamFailoverError{
+		StatusCode:   400,
+		ResponseBody: []byte(`{"error":{"message":"Invalid schema for response_format 'agentic_plan'"}}`),
+	}, false)
+
+	require.Equal(t, http.StatusBadRequest, w.Code)
+	var parsed map[string]any
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &parsed))
+	errorObj, ok := parsed["error"].(map[string]any)
+	require.True(t, ok)
+	assert.Equal(t, "invalid_request_error", errorObj["type"])
+	assert.Equal(t, "Invalid schema for response_format 'agentic_plan'", errorObj["message"])
+}
+
+func TestOpenAIHandleFailoverExhausted_AccountShaped400StaysOpaque502(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	bodies := []string{
+		`{"error":{"message":"Your organization has been disabled."}}`,
+		`{"error":{"message":"Your credit balance is too low to access the API."}}`,
+		`{"error":{"message":"Identity verification is required to access this model."}}`,
+	}
+	for _, body := range bodies {
+		w := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(w)
+		c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+
+		h := &OpenAIGatewayHandler{}
+		h.handleFailoverExhausted(c, &service.UpstreamFailoverError{
+			StatusCode:   400,
+			ResponseBody: []byte(body),
+		}, false)
+
+		require.Equal(t, http.StatusBadGateway, w.Code, "account-shaped 400 must not leak to the client: %s", body)
+		var parsed map[string]any
+		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &parsed))
+		errorObj, ok := parsed["error"].(map[string]any)
+		require.True(t, ok)
+		assert.Equal(t, "upstream_error", errorObj["type"])
+		assert.NotContains(t, errorObj["message"], "organization")
+		assert.NotContains(t, errorObj["message"], "credit balance")
+		assert.NotContains(t, errorObj["message"], "verification")
+	}
+}

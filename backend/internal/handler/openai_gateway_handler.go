@@ -1094,6 +1094,16 @@ func (h *OpenAIGatewayHandler) anthropicStreamingAwareError(c *gin.Context, stat
 // handleAnthropicFailoverExhausted maps upstream failover errors to Anthropic format.
 func (h *OpenAIGatewayHandler) handleAnthropicFailoverExhausted(c *gin.Context, failoverErr *service.UpstreamFailoverError, streamStarted bool) {
 	status, errType, errMsg := h.mapUpstreamError(failoverErr.StatusCode)
+	if service.IsOpenAIUpstreamRequestError(failoverErr.StatusCode) {
+		if service.ShouldPassthroughOpenAIUpstreamRequestError(failoverErr.StatusCode, failoverErr.ResponseBody) {
+			errMsg = service.OpenAIUpstreamRequestErrorMessage(failoverErr.ResponseBody)
+		} else {
+			// Transient overloads and account-shaped 400s ride request-shaped
+			// statuses but are not the client's fault; keep the retryable,
+			// opaque mapping.
+			status, errType, errMsg = http.StatusBadGateway, "upstream_error", "Upstream service temporarily unavailable"
+		}
+	}
 	h.anthropicStreamingAwareError(c, status, errType, errMsg, streamStarted)
 }
 
@@ -1984,6 +1994,16 @@ func (h *OpenAIGatewayHandler) handleFailoverExhausted(c *gin.Context, failoverE
 
 	// 使用默认的错误映射
 	status, errType, errMsg := h.mapUpstreamError(statusCode)
+	if service.IsOpenAIUpstreamRequestError(statusCode) {
+		if service.ShouldPassthroughOpenAIUpstreamRequestError(statusCode, responseBody) {
+			errMsg = service.OpenAIUpstreamRequestErrorMessage(responseBody)
+		} else {
+			// Transient overloads and account-shaped 400s ride request-shaped
+			// statuses but are not the client's fault; keep the retryable,
+			// opaque mapping.
+			status, errType, errMsg = http.StatusBadGateway, "upstream_error", "Upstream service temporarily unavailable"
+		}
+	}
 	h.handleStreamingAwareError(c, status, errType, errMsg, streamStarted)
 }
 
@@ -1995,6 +2015,12 @@ func (h *OpenAIGatewayHandler) handleFailoverExhaustedSimple(c *gin.Context, sta
 }
 
 func (h *OpenAIGatewayHandler) mapUpstreamError(statusCode int) (int, string, string) {
+	// Request-shaped 4xx are deterministic: pass the status through so clients
+	// stop auto-retrying what can never succeed. Callers that hold the upstream
+	// response body enrich the generic message with the real upstream cause.
+	if service.IsOpenAIUpstreamRequestError(statusCode) {
+		return statusCode, service.OpenAIUpstreamRequestErrorType(statusCode), service.OpenAIUpstreamRequestErrorFallbackMessage
+	}
 	switch statusCode {
 	case 401:
 		return http.StatusBadGateway, "upstream_error", "Upstream authentication failed, please contact administrator"

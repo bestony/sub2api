@@ -156,6 +156,8 @@ func mapResponsesErrorCode(errType string) string {
 		return "rate_limit_exceeded"
 	case "invalid_request_error":
 		return "invalid_request"
+	case "not_found_error":
+		return "not_found"
 	case "permission_error":
 		return "permission_denied"
 	case "authentication_error":

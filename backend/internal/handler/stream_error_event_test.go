@@ -239,6 +239,7 @@ func TestMapResponsesErrorCode(t *testing.T) {
 	cases := []struct{ in, out string }{
 		{"rate_limit_error", "rate_limit_exceeded"},
 		{"invalid_request_error", "invalid_request"},
+		{"not_found_error", "not_found"},
 		{"permission_error", "permission_denied"},
 		{"authentication_error", "authentication_failed"},
 		{"upstream_error", "upstream_error"},
