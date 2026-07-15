@@ -21,8 +21,8 @@ const (
 	openAIWSConnMaxAge = 60 * time.Minute
 	// openAIWSConnHealthCheckIdle: 复用前健康检查的最小空闲时长。
 	// 0 表示只要复用连接就 ping（现网 broken pipe 多由 idle 不足原 90s 阈值的半死连接引起）。
-	openAIWSConnHealthCheckIdle = 0
-	openAIWSConnHealthCheckTO   = 2 * time.Second
+	openAIWSConnHealthCheckIdle    = 0
+	openAIWSConnHealthCheckTO      = 2 * time.Second
 	openAIWSConnPrewarmExtraDelay  = 2 * time.Second
 	openAIWSAcquireCleanupInterval = 3 * time.Second
 	openAIWSBackgroundPingInterval = 30 * time.Second

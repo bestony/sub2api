@@ -23,6 +23,7 @@ import (
 	coderws "github.com/coder/websocket"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/require"
+	"github.com/tidwall/gjson"
 )
 
 type grokCredentialHandlerRepo struct {
@@ -776,11 +777,20 @@ func TestResponsesWebSocketCredentialFailoverLoop(t *testing.T) {
 		defer closeConn()
 		writeFirst(t, conn)
 
+		// 失败出口会先发 response.failed 再 Close，避免 Codex 盲重连。
 		readCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-		_, _, err := conn.Read(readCtx)
+		msgType, payload, err := conn.Read(readCtx)
 		cancel()
+		require.NoError(t, err)
+		require.Equal(t, coderws.MessageText, msgType)
+		require.Equal(t, "response.failed", gjson.GetBytes(payload, "type").String())
+		require.Contains(t, gjson.GetBytes(payload, "response.error.message").String(), service.GrokCredentialUnavailableClientMessage)
+
+		closeCtx, cancelClose := context.WithTimeout(context.Background(), 3*time.Second)
+		_, _, closeErrRaw := conn.Read(closeCtx)
+		cancelClose()
 		var closeErr coderws.CloseError
-		require.ErrorAs(t, err, &closeErr)
+		require.ErrorAs(t, closeErrRaw, &closeErr)
 		require.Contains(t, closeErr.Reason, service.GrokCredentialUnavailableClientMessage)
 		require.Equal(t, 1, repo.selectorCalls())
 		require.Empty(t, upstream.accountHits())
