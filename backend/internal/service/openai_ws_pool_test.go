@@ -1314,13 +1314,13 @@ func TestOpenAIWSConnPool_UtilityBranches(t *testing.T) {
 	_, ok = pool.getAccountPool(8)
 	require.False(t, ok)
 
-	// health check 条件
+	// health check 条件：阈值 0 时，只要支持 idle ping 的连接在 reuse 前都应检查。
 	require.False(t, pool.shouldHealthCheckConn(nil))
 	conn := newOpenAIWSConn("health", 1, &openAIWSFakeConn{}, nil)
-	conn.lastUsedNano.Store(time.Now().Add(-openAIWSConnHealthCheckIdle - time.Second).UnixNano())
-	require.True(t, pool.shouldHealthCheckConn(conn))
+	conn.lastUsedNano.Store(time.Now().UnixNano())
+	require.True(t, pool.shouldHealthCheckConn(conn), "health check idle=0 时应在每次 reuse 前 ping")
 	unsafeConn := newOpenAIWSConn("unsafe_health", 1, &openAIWSIdlePingUnsupportedConn{}, nil)
-	unsafeConn.lastUsedNano.Store(time.Now().Add(-openAIWSConnHealthCheckIdle - time.Second).UnixNano())
+	unsafeConn.lastUsedNano.Store(time.Now().UnixNano())
 	require.False(t, pool.shouldHealthCheckConn(unsafeConn))
 }
 

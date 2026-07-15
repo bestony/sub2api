@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"testing"
@@ -60,6 +61,42 @@ func TestIsOpenAIWSIngressPreviousResponseNotFound(t *testing.T) {
 	require.True(t, isOpenAIWSIngressPreviousResponseNotFound(
 		wrapOpenAIWSIngressTurnError(openAIWSIngressStagePreviousResponseNotFound, errors.New("previous response not found"), false),
 	))
+}
+
+func TestIsOpenAIWSDeadUpstreamConnError(t *testing.T) {
+	t.Parallel()
+
+	require.False(t, isOpenAIWSDeadUpstreamConnError(nil))
+	require.False(t, isOpenAIWSDeadUpstreamConnError(errors.New("validation failed")))
+	require.True(t, isOpenAIWSDeadUpstreamConnError(errors.New("write tcp 1:1->2:2: write: broken pipe")))
+	require.True(t, isOpenAIWSDeadUpstreamConnError(errors.New("write tcp 1:1->2:2: write: connection timed out")))
+	require.True(t, isOpenAIWSDeadUpstreamConnError(errors.New("failed to flush flate: failed to write data frame")))
+	require.True(t, isOpenAIWSDeadUpstreamConnError(io.EOF))
+}
+
+func TestIsOpenAIWSIngressTurnRetryable_DeadWriteUpstream(t *testing.T) {
+	t.Parallel()
+
+	deadWrite := wrapOpenAIWSIngressTurnError(
+		"write_upstream",
+		fmt.Errorf("write upstream websocket request: %w", errors.New("write: broken pipe")),
+		false,
+	)
+	require.True(t, isOpenAIWSIngressTurnRetryable(deadWrite))
+	require.Equal(t, "write_upstream", openAIWSIngressTurnRetryReason(deadWrite))
+
+	alreadyWrote := wrapOpenAIWSIngressTurnError(
+		"write_upstream",
+		errors.New("write: broken pipe"),
+		true,
+	)
+	require.False(t, isOpenAIWSIngressTurnRetryable(alreadyWrote))
+
+	stage, retried, wroteDownstream, ok := OpenAIWSIngressTurnErrorMeta(markOpenAIWSIngressTurnRetried(deadWrite))
+	require.True(t, ok)
+	require.Equal(t, "write_upstream", stage)
+	require.True(t, retried)
+	require.False(t, wroteDownstream)
 }
 
 func TestOpenAIWSIngressPreviousResponseRecoveryEnabled(t *testing.T) {

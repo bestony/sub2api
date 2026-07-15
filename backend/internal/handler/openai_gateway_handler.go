@@ -1841,11 +1841,16 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 
 			h.gatewayService.ReportOpenAIAccountScheduleResult(account.ID, false, nil)
 			closeStatus, closeReason := summarizeWSCloseErrorForLog(err)
+			stage, retried, wroteDownstream, hasTurnMeta := service.OpenAIWSIngressTurnErrorMeta(err)
 			proxyFailedFields := []zap.Field{
 				zap.Int64("account_id", account.ID),
 				zap.Error(err),
 				zap.String("close_status", closeStatus),
 				zap.String("close_reason", closeReason),
+				zap.String("stage", stage),
+				zap.Bool("retried", retried),
+				zap.Bool("wrote_downstream", wroteDownstream),
+				zap.Bool("has_turn_meta", hasTurnMeta),
 			}
 			if account.Proxy != nil {
 				proxyFailedFields = append(proxyFailedFields,
@@ -1858,11 +1863,17 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 				proxyFailedFields = append(proxyFailedFields, zap.Int64p("proxy_id", account.ProxyID))
 			}
 			reqLog.Warn("openai.websocket_proxy_failed", proxyFailedFields...)
+			// Codex 严格要求先收到 response.failed/completed，否则会把 Close 当成
+			// "websocket closed by server before response.completed" 并盲重连。
+			failedMsg := strings.TrimSpace(err.Error())
+			if failedMsg == "" {
+				failedMsg = "upstream websocket proxy failed"
+			}
 			if errors.As(err, &closeErr) {
-				closeOpenAIClientWS(wsConn, closeErr.StatusCode(), closeErr.Reason())
+				closeOpenAIClientWSWithFailedEvent(ctx, wsConn, closeErr.StatusCode(), closeErr.Reason(), failedMsg)
 				return
 			}
-			closeOpenAIClientWS(wsConn, coderws.StatusInternalError, "upstream websocket proxy failed")
+			closeOpenAIClientWSWithFailedEvent(ctx, wsConn, coderws.StatusInternalError, "upstream websocket proxy failed", failedMsg)
 			return
 		}
 		reqLog.Info("openai.websocket_ingress_closed", zap.Int64("account_id", account.ID))
@@ -2357,24 +2368,68 @@ func closeOpenAIClientWS(conn *coderws.Conn, status coderws.StatusCode, reason s
 	_ = conn.CloseNow()
 }
 
+// writeOpenAIWSResponsesFailedEvent emits a Responses-protocol terminal event so Codex
+// does not treat a subsequent Close as "websocket closed by server before response.completed".
+func writeOpenAIWSResponsesFailedEvent(ctx context.Context, conn *coderws.Conn, message string) {
+	if conn == nil {
+		return
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	message = strings.TrimSpace(message)
+	if message == "" {
+		message = "upstream websocket proxy failed"
+	}
+	if len(message) > 500 {
+		message = message[:500]
+	}
+	respID := "resp_" + strings.ReplaceAll(uuid.NewString(), "-", "")
+	payload, err := json.Marshal(gin.H{
+		"type": "response.failed",
+		"response": gin.H{
+			"id":     respID,
+			"object": "response",
+			"status": "failed",
+			"output": []any{},
+			"error": gin.H{
+				"code":    "upstream_error",
+				"message": message,
+			},
+		},
+	})
+	if err != nil {
+		payload = []byte(`{"type":"response.failed","response":{"id":"resp_ws_proxy_failed","object":"response","status":"failed","output":[],"error":{"code":"upstream_error","message":"upstream websocket proxy failed"}}}`)
+	}
+	writeCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	_ = conn.Write(writeCtx, coderws.MessageText, payload)
+}
+
+// closeOpenAIClientWSWithFailedEvent sends response.failed then closes the client websocket.
+func closeOpenAIClientWSWithFailedEvent(ctx context.Context, conn *coderws.Conn, status coderws.StatusCode, reason, message string) {
+	writeOpenAIWSResponsesFailedEvent(ctx, conn, message)
+	closeOpenAIClientWS(conn, status, reason)
+}
+
 func closeOpenAIWSFailoverExhausted(conn *coderws.Conn, failoverErr *service.UpstreamFailoverError) {
 	if failoverErr == nil {
-		closeOpenAIClientWS(conn, coderws.StatusInternalError, "upstream websocket proxy failed")
+		closeOpenAIClientWSWithFailedEvent(context.Background(), conn, coderws.StatusInternalError, "upstream websocket proxy failed", "upstream websocket proxy failed")
 		return
 	}
 	if failoverErr.Stage == service.GatewayFailureStageAccountAuth {
-		closeOpenAIClientWS(conn, coderws.StatusTryAgainLater, service.GrokCredentialUnavailableClientMessage)
+		closeOpenAIClientWSWithFailedEvent(context.Background(), conn, coderws.StatusTryAgainLater, service.GrokCredentialUnavailableClientMessage, service.GrokCredentialUnavailableClientMessage)
 		return
 	}
 	switch failoverErr.StatusCode {
 	case http.StatusTooManyRequests:
-		closeOpenAIClientWS(conn, coderws.StatusTryAgainLater, "upstream rate limit exceeded, please retry later")
+		closeOpenAIClientWSWithFailedEvent(context.Background(), conn, coderws.StatusTryAgainLater, "upstream rate limit exceeded, please retry later", "upstream rate limit exceeded, please retry later")
 	case 529, http.StatusInternalServerError, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
-		closeOpenAIClientWS(conn, coderws.StatusTryAgainLater, "upstream service temporarily unavailable")
+		closeOpenAIClientWSWithFailedEvent(context.Background(), conn, coderws.StatusTryAgainLater, "upstream service temporarily unavailable", "upstream service temporarily unavailable")
 	case http.StatusUnauthorized, http.StatusForbidden:
-		closeOpenAIClientWS(conn, coderws.StatusPolicyViolation, "upstream websocket authentication failed")
+		closeOpenAIClientWSWithFailedEvent(context.Background(), conn, coderws.StatusPolicyViolation, "upstream websocket authentication failed", "upstream websocket authentication failed")
 	default:
-		closeOpenAIClientWS(conn, coderws.StatusInternalError, "upstream websocket proxy failed")
+		closeOpenAIClientWSWithFailedEvent(context.Background(), conn, coderws.StatusInternalError, "upstream websocket proxy failed", "upstream websocket proxy failed")
 	}
 }
 

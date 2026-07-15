@@ -4,8 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"math/rand"
+	"net"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/pkg/logger"
@@ -94,6 +97,7 @@ type openAIWSIngressTurnError struct {
 	stage           string
 	cause           error
 	wroteDownstream bool
+	retried         bool
 }
 
 func (e *openAIWSIngressTurnError) Error() string {
@@ -113,6 +117,24 @@ func (e *openAIWSIngressTurnError) Unwrap() error {
 	return e.cause
 }
 
+// Stage returns the ingress turn failure stage (e.g. write_upstream). Empty if not a turn error.
+func (e *openAIWSIngressTurnError) Stage() string {
+	if e == nil {
+		return ""
+	}
+	return strings.TrimSpace(e.stage)
+}
+
+// WroteDownstream reports whether any business frame was already written to the client.
+func (e *openAIWSIngressTurnError) WroteDownstream() bool {
+	return e != nil && e.wroteDownstream
+}
+
+// Retried reports whether the ingress layer already attempted a same-turn recovery.
+func (e *openAIWSIngressTurnError) Retried() bool {
+	return e != nil && e.retried
+}
+
 func wrapOpenAIWSIngressTurnError(stage string, cause error, wroteDownstream bool) error {
 	if cause == nil {
 		return nil
@@ -124,15 +146,69 @@ func wrapOpenAIWSIngressTurnError(stage string, cause error, wroteDownstream boo
 	}
 }
 
+// markOpenAIWSIngressTurnRetried attaches a retried=true flag when err is an ingress turn error.
+func markOpenAIWSIngressTurnRetried(err error) error {
+	var turnErr *openAIWSIngressTurnError
+	if !errors.As(err, &turnErr) || turnErr == nil {
+		return err
+	}
+	turnErr.retried = true
+	return turnErr
+}
+
+// OpenAIWSIngressTurnErrorMeta extracts stage/retried/wrote_downstream for structured logs.
+func OpenAIWSIngressTurnErrorMeta(err error) (stage string, retried bool, wroteDownstream bool, ok bool) {
+	var turnErr *openAIWSIngressTurnError
+	if !errors.As(err, &turnErr) || turnErr == nil {
+		return "", false, false, false
+	}
+	return turnErr.Stage(), turnErr.Retried(), turnErr.WroteDownstream(), true
+}
+
+// isOpenAIWSDeadUpstreamConnError reports transport-level dead upstream connections that are safe to
+// recover by marking the lease broken and forcing a new connection.
+func isOpenAIWSDeadUpstreamConnError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) || errors.Is(err, errOpenAIWSConnClosed) {
+		return true
+	}
+	var opErr *net.OpError
+	if errors.As(err, &opErr) && opErr != nil {
+		if errors.Is(opErr.Err, syscall.EPIPE) || errors.Is(opErr.Err, syscall.ECONNRESET) || errors.Is(opErr.Err, syscall.ETIMEDOUT) {
+			return true
+		}
+	}
+	message := strings.ToLower(strings.TrimSpace(err.Error()))
+	if message == "" {
+		return false
+	}
+	return strings.Contains(message, "broken pipe") ||
+		strings.Contains(message, "connection reset by peer") ||
+		strings.Contains(message, "connection timed out") ||
+		strings.Contains(message, "use of closed network connection") ||
+		strings.Contains(message, "an existing connection was forcibly closed by the remote host") ||
+		strings.Contains(message, "an established connection was aborted") ||
+		strings.Contains(message, "unexpected eof") ||
+		strings.Contains(message, "failed to write frame") ||
+		strings.Contains(message, "failed to flush flate")
+}
+
 func isOpenAIWSIngressTurnRetryable(err error) bool {
 	var turnErr *openAIWSIngressTurnError
 	if !errors.As(err, &turnErr) || turnErr == nil {
 		return false
 	}
-	if errors.Is(turnErr.cause, context.Canceled) || errors.Is(turnErr.cause, context.DeadlineExceeded) {
+	if turnErr.wroteDownstream {
 		return false
 	}
-	if turnErr.wroteDownstream {
+	// write_upstream on a dead pooled connection must retry even if a write deadline is nested
+	// in the error chain — OS ETIMEDOUT/broken pipe is recoverable by forcing a new conn.
+	if turnErr.stage == "write_upstream" && isOpenAIWSDeadUpstreamConnError(turnErr.cause) {
+		return true
+	}
+	if errors.Is(turnErr.cause, context.Canceled) || errors.Is(turnErr.cause, context.DeadlineExceeded) {
 		return false
 	}
 	switch turnErr.stage {

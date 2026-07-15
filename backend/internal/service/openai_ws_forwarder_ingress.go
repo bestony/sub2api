@@ -644,16 +644,22 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 	}
 
 	agentTaskRecoveryTried := false
+	// write_upstream 重试时置 true，下一次 acquire 强制新连。
+	forceNewConnOnNextAcquire := false
 	var acquireTurnLease func(int, string, bool) (*openAIWSConnLease, error)
 	acquireTurnLease = func(turn int, preferred string, forcePreferredConn bool) (*openAIWSConnLease, error) {
 		req := cloneOpenAIWSAcquireRequest(baseAcquireReq)
 		req.PreferredConnID = strings.TrimSpace(preferred)
 		req.ForcePreferredConn = forcePreferredConn
 		// dedicated 模式下每次获取均新建连接，避免跨会话复用残留上下文。
-		req.ForceNewConn = dedicatedMode
+		// write_upstream 重试时强制新连，避免再拿到同一条半死连接。
+		req.ForceNewConn = dedicatedMode || forceNewConnOnNextAcquire
 		acquireCtx, acquireCancel := context.WithTimeout(ctx, acquireTimeout)
 		lease, acquireErr := pool.Acquire(acquireCtx, req)
 		acquireCancel()
+		if acquireErr == nil {
+			forceNewConnOnNextAcquire = false
+		}
 		var dialErr *openAIWSDialError
 		if acquireErr != nil && s.isAgentIdentityAccount(ctx, account) && errors.As(acquireErr, &dialErr) && isAgentIdentityTaskInvalidWSDialError(dialErr) && !agentTaskRecoveryTried {
 			agentTaskRecoveryTried = true
@@ -741,6 +747,8 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 		turnStart := time.Now()
 		wroteDownstream := false
 		if err := lease.WriteJSONWithContextTimeout(ctx, json.RawMessage(payload), s.openAIWSWriteTimeout()); err != nil {
+			// 写失败后连接不可复用（半死/对端已关），立即 MarkBroken 避免回池。
+			lease.MarkBroken()
 			return nil, wrapOpenAIWSIngressTurnError(
 				"write_upstream",
 				fmt.Errorf("write upstream websocket request: %w", err),
@@ -1155,25 +1163,49 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 	}
 	retryIngressTurn := func(relayErr error, turn int, connID string) bool {
 		if !isOpenAIWSIngressTurnRetryable(relayErr) || turnRetry >= 1 {
+			if !isOpenAIWSIngressTurnRetryable(relayErr) {
+				logOpenAIWSModeInfo(
+					"ingress_ws_turn_retry_skip account_id=%d turn=%d conn_id=%s reason=not_retryable stage=%s",
+					account.ID,
+					turn,
+					truncateOpenAIWSLogValue(connID, openAIWSIDValueMaxLen),
+					truncateOpenAIWSLogValue(openAIWSIngressTurnRetryReason(relayErr), openAIWSLogValueMaxLen),
+				)
+			} else {
+				logOpenAIWSModeInfo(
+					"ingress_ws_turn_retry_skip account_id=%d turn=%d conn_id=%s reason=retry_budget_exhausted stage=%s",
+					account.ID,
+					turn,
+					truncateOpenAIWSLogValue(connID, openAIWSIDValueMaxLen),
+					truncateOpenAIWSLogValue(openAIWSIngressTurnRetryReason(relayErr), openAIWSLogValueMaxLen),
+				)
+			}
 			return false
 		}
-		if isStrictAffinityTurn(currentPayload) {
+		// write 死连接重试优先换新连，不能被 strict affinity 卡住在坏连接上。
+		retryReason := openAIWSIngressTurnRetryReason(relayErr)
+		if isStrictAffinityTurn(currentPayload) && retryReason != "write_upstream" {
 			logOpenAIWSModeInfo(
-				"ingress_ws_turn_retry_skip account_id=%d turn=%d conn_id=%s reason=strict_affinity",
+				"ingress_ws_turn_retry_skip account_id=%d turn=%d conn_id=%s reason=strict_affinity stage=%s",
 				account.ID,
 				turn,
 				truncateOpenAIWSLogValue(connID, openAIWSIDValueMaxLen),
+				truncateOpenAIWSLogValue(retryReason, openAIWSLogValueMaxLen),
 			)
 			return false
 		}
 		turnRetry++
+		if retryReason == "write_upstream" || isOpenAIWSDeadUpstreamConnError(relayErr) {
+			forceNewConnOnNextAcquire = true
+		}
 		logOpenAIWSModeInfo(
-			"ingress_ws_turn_retry account_id=%d turn=%d retry=%d reason=%s conn_id=%s",
+			"ingress_ws_turn_retry account_id=%d turn=%d retry=%d reason=%s conn_id=%s force_new_conn=%v",
 			account.ID,
 			turn,
 			turnRetry,
-			truncateOpenAIWSLogValue(openAIWSIngressTurnRetryReason(relayErr), openAIWSLogValueMaxLen),
+			truncateOpenAIWSLogValue(retryReason, openAIWSLogValueMaxLen),
 			truncateOpenAIWSLogValue(connID, openAIWSIDValueMaxLen),
+			forceNewConnOnNextAcquire,
 		)
 		resetSessionLease(true)
 		skipBeforeTurn = true
@@ -1496,17 +1528,25 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 			if retryIngressTurn(relayErr, turn, connID) {
 				continue
 			}
+			// 保留 openAIWSIngressTurnError 包装，供 handler 打 stage/retried 结构化字段。
 			finalErr := relayErr
-			if unwrapped := errors.Unwrap(relayErr); unwrapped != nil {
-				finalErr = unwrapped
+			if turnRetry > 0 {
+				finalErr = markOpenAIWSIngressTurnRetried(relayErr)
 			}
 			if hooks != nil && hooks.AfterTurn != nil {
-				hooks.AfterTurn(turn, nil, finalErr)
+				hookErr := finalErr
+				if unwrapped := errors.Unwrap(finalErr); unwrapped != nil {
+					hookErr = unwrapped
+				}
+				hooks.AfterTurn(turn, nil, hookErr)
 			}
-			sessionLease.MarkBroken()
+			if sessionLease != nil {
+				sessionLease.MarkBroken()
+			}
 			return finalErr
 		}
 		turnRetry = 0
+		forceNewConnOnNextAcquire = false
 		turnPrevRecoveryTried = false
 		lastTurnFinishedAt = time.Now()
 		lastTurnClean = true
