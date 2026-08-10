@@ -43,13 +43,6 @@ vi.mock('vue-i18n', async () => {
   }
 })
 
-const formatLocalDate = (date: Date): string => {
-  const year = date.getFullYear()
-  const month = String(date.getMonth() + 1).padStart(2, '0')
-  const day = String(date.getDate()).padStart(2, '0')
-  return `${year}-${month}-${day}`
-}
-
 const createDashboardStats = (): DashboardStats => ({
   total_users: 0,
   today_new_users: 0,
@@ -133,14 +126,23 @@ describe('admin DashboardView', () => {
 
     await flushPromises()
 
-    const now = new Date()
-    const yesterday = new Date(now.getTime() - 24 * 60 * 60 * 1000)
-
     expect(getSnapshotV2).toHaveBeenCalledTimes(1)
-    expect(getSnapshotV2).toHaveBeenCalledWith(expect.objectContaining({
-      start_date: formatLocalDate(yesterday),
-      end_date: formatLocalDate(now),
-      granularity: 'hour'
-    }))
+    const call = getSnapshotV2.mock.calls[0]?.[0] as {
+      start_time?: string
+      end_time?: string
+      start_date?: string
+      end_date?: string
+      granularity?: string
+    }
+    expect(call.granularity).toBe('hour')
+    expect(call.start_date).toBeUndefined()
+    expect(call.end_date).toBeUndefined()
+    expect(call.start_time).toBeTruthy()
+    expect(call.end_time).toBeTruthy()
+
+    const startMs = Date.parse(call.start_time!)
+    const endMs = Date.parse(call.end_time!)
+    expect(Math.abs(endMs - startMs - 24 * 60 * 60 * 1000)).toBeLessThanOrEqual(2000)
+    expect(Math.abs(endMs - Date.now())).toBeLessThanOrEqual(5000)
   })
 })

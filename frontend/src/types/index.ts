@@ -2055,6 +2055,10 @@ export interface UserErrorListParams {
   page_size?: number
   start_date?: string
   end_date?: string
+  /** RFC3339; takes precedence over start_date when set */
+  start_time?: string
+  /** RFC3339; takes precedence over end_date when set */
+  end_time?: string
   timezone?: string
   model?: string
   status_code?: number
@@ -2079,6 +2083,10 @@ export interface UsageQueryParams {
   billing_mode?: string | null
   start_date?: string
   end_date?: string
+  /** RFC3339; takes precedence over start_date when set */
+  start_time?: string
+  /** RFC3339; takes precedence over end_date when set */
+  end_time?: string
   timezone?: string
   sort_by?: string
   sort_order?: 'asc' | 'desc'

@@ -279,23 +279,59 @@ const formatLD = (d: Date) => {
   const day = String(d.getDate()).padStart(2, '0')
   return `${year}-${month}-${day}`
 }
-const getLast24HoursRangeDates = (): { start: string; end: string } => {
+const getLast24HoursRange = (): { start: string; end: string; startTime: string; endTime: string } => {
   const end = new Date()
   const start = new Date(end.getTime() - 24 * 60 * 60 * 1000)
   return {
     start: formatLD(start),
-    end: formatLD(end)
+    end: formatLD(end),
+    startTime: start.toISOString(),
+    endTime: end.toISOString(),
   }
 }
-const getGranularityForRange = (start: string, end: string): 'day' | 'hour' => {
+const getGranularityForRange = (
+  start: string,
+  end: string,
+  opts?: { precise?: boolean }
+): 'day' | 'hour' => {
+  if (opts?.precise) return 'hour'
   const startTime = new Date(`${start}T00:00:00`).getTime()
   const endTime = new Date(`${end}T00:00:00`).getTime()
   const daysDiff = Math.ceil((endTime - startTime) / (1000 * 60 * 60 * 24))
   return daysDiff <= 1 ? 'hour' : 'day'
 }
-const defaultRange = getLast24HoursRangeDates()
+const defaultRange = getLast24HoursRange()
 const startDate = ref(defaultRange.start); const endDate = ref(defaultRange.end)
-const filters = ref<AdminUsageQueryParams>({ user_id: undefined, model: undefined, group_id: undefined, request_type: undefined, billing_type: null, start_date: startDate.value, end_date: endDate.value })
+const filters = ref<AdminUsageQueryParams>({
+  user_id: undefined,
+  model: undefined,
+  group_id: undefined,
+  request_type: undefined,
+  billing_type: null,
+  start_date: startDate.value,
+  end_date: endDate.value,
+  start_time: defaultRange.startTime,
+  end_time: defaultRange.endTime,
+})
+
+/** Prefer second-precision bounds when present; otherwise day-level dates. */
+const rangeQueryParams = () => {
+  const hasPrecise = Boolean(filters.value.start_time) && Boolean(filters.value.end_time)
+  if (hasPrecise) {
+    return {
+      start_time: filters.value.start_time,
+      end_time: filters.value.end_time,
+      start_date: undefined as string | undefined,
+      end_date: undefined as string | undefined,
+    }
+  }
+  return {
+    start_date: filters.value.start_date || startDate.value,
+    end_date: filters.value.end_date || endDate.value,
+    start_time: undefined as string | undefined,
+    end_time: undefined as string | undefined,
+  }
+}
 const pagination = reactive({ page: 1, page_size: getPersistedPageSize(), total: 0 })
 const sortState = reactive({
   sort_by: 'created_at',
@@ -317,6 +353,8 @@ const getNumericQueryValue = (value: string | null | Array<string | null> | unde
 const applyRouteQueryFilters = () => {
   const queryStartDate = getSingleQueryValue(route.query.start_date)
   const queryEndDate = getSingleQueryValue(route.query.end_date)
+  const queryStartTime = getSingleQueryValue(route.query.start_time)
+  const queryEndTime = getSingleQueryValue(route.query.end_time)
   const queryUserId = getNumericQueryValue(route.query.user_id)
 
   if (queryStartDate) {
@@ -326,13 +364,30 @@ const applyRouteQueryFilters = () => {
     endDate.value = queryEndDate
   }
 
+  const hasPrecise = Boolean(queryStartTime && queryEndTime)
+  // Date-only deep links drop second-precision bounds so day expansion applies.
+  // Time deep links win; otherwise keep existing default rolling 24h times.
+  let nextStartTime = filters.value.start_time
+  let nextEndTime = filters.value.end_time
+  if (hasPrecise) {
+    nextStartTime = queryStartTime
+    nextEndTime = queryEndTime
+  } else if (queryStartDate || queryEndDate) {
+    nextStartTime = undefined
+    nextEndTime = undefined
+  }
+
   filters.value = {
     ...filters.value,
     user_id: queryUserId,
     start_date: startDate.value,
-    end_date: endDate.value
+    end_date: endDate.value,
+    start_time: nextStartTime,
+    end_time: nextEndTime,
   }
-  granularity.value = getGranularityForRange(startDate.value, endDate.value)
+  granularity.value = getGranularityForRange(startDate.value, endDate.value, {
+    precise: Boolean(filters.value.start_time && filters.value.end_time),
+  })
 }
 
 const loadRouteUserFilterLabel = async () => {
@@ -355,15 +410,24 @@ const loadRouteUserFilterLabel = async () => {
   }
 }
 
-const onDateRangeChange = (range: { startDate: string; endDate: string; preset: string | null }) => {
+const onDateRangeChange = (range: {
+  startDate: string
+  endDate: string
+  startTime?: string
+  endTime?: string
+  preset: string | null
+}) => {
   startDate.value = range.startDate
   endDate.value = range.endDate
+  const precise = Boolean(range.startTime && range.endTime)
   filters.value = {
     ...filters.value,
     start_date: range.startDate,
-    end_date: range.endDate
+    end_date: range.endDate,
+    start_time: precise ? range.startTime : undefined,
+    end_time: precise ? range.endTime : undefined,
   }
-  granularity.value = getGranularityForRange(range.startDate, range.endDate)
+  granularity.value = getGranularityForRange(range.startDate, range.endDate, { precise })
   applyFilters()
 }
 
@@ -379,6 +443,7 @@ const buildUsageListParams = (
     page_size: pageSize,
     exact_total: exactTotal,
     ...filters.value,
+    ...rangeQueryParams(),
     stream: legacyStream === null ? undefined : legacyStream,
     sort_by: sortState.sort_by,
     sort_order: sortState.sort_order
@@ -403,6 +468,7 @@ const loadStats = async (force = false) => {
     const legacyStream = requestType ? requestTypeToLegacyStream(requestType) : filters.value.stream
     const s = await adminAPI.usage.getStats({
       ...filters.value,
+      ...rangeQueryParams(),
       stream: legacyStream === null ? undefined : legacyStream,
       ...(force ? { nocache: 1 } : {}),
     })
@@ -440,8 +506,7 @@ const loadModelStats = async (source: ModelDistributionSource, force = false) =>
     const requestType = filters.value.request_type
     const legacyStream = requestType ? requestTypeToLegacyStream(requestType) : filters.value.stream
     const baseParams = {
-      start_date: filters.value.start_date || startDate.value,
-      end_date: filters.value.end_date || endDate.value,
+      ...rangeQueryParams(),
       user_id: filters.value.user_id,
       model: filters.value.model,
       api_key_id: filters.value.api_key_id,
@@ -489,8 +554,7 @@ const loadChartData = async () => {
     const requestType = filters.value.request_type
     const legacyStream = requestType ? requestTypeToLegacyStream(requestType) : filters.value.stream
     const snapshot = await adminAPI.dashboard.getSnapshotV2({
-      start_date: filters.value.start_date || startDate.value,
-      end_date: filters.value.end_date || endDate.value,
+      ...rangeQueryParams(),
       granularity: granularity.value,
       user_id: filters.value.user_id,
       model: filters.value.model,
@@ -536,11 +600,19 @@ const refreshData = () => {
   if (rankingMounted.value) rankingRef.value?.reload()
 }
 const resetFilters = () => {
-  const range = getLast24HoursRangeDates()
+  const range = getLast24HoursRange()
   startDate.value = range.start
   endDate.value = range.end
-  filters.value = { start_date: startDate.value, end_date: endDate.value, request_type: undefined, billing_type: null, billing_mode: undefined }
-  granularity.value = getGranularityForRange(startDate.value, endDate.value)
+  filters.value = {
+    start_date: startDate.value,
+    end_date: endDate.value,
+    start_time: range.startTime,
+    end_time: range.endTime,
+    request_type: undefined,
+    billing_type: null,
+    billing_mode: undefined,
+  }
+  granularity.value = getGranularityForRange(startDate.value, endDate.value, { precise: true })
   applyFilters()
 }
 const handlePageChange = (p: number) => { pagination.page = p; loadLogs() }
@@ -796,12 +868,17 @@ const toRFC3339 = (d: string | undefined, endOfDay = false): string | undefined 
 const loadAdminErrors = async () => {
   errLoading.value = true
   try {
+    const hasPrecise = Boolean(filters.value.start_time) && Boolean(filters.value.end_time)
     const resp = await listErrorLogs({
       page: errPage.value,
       page_size: errPageSize.value,
       view: 'all',
-      start_time: toRFC3339(filters.value.start_date),
-      end_time: toRFC3339(filters.value.end_date, true),
+      start_time: hasPrecise
+        ? filters.value.start_time
+        : toRFC3339(filters.value.start_date),
+      end_time: hasPrecise
+        ? filters.value.end_time
+        : toRFC3339(filters.value.end_date, true),
       user_id: filters.value.user_id ?? undefined,
       api_key_id: filters.value.api_key_id ?? undefined,
       account_id: filters.value.account_id ?? undefined,
