@@ -21,6 +21,8 @@ type userUsageFilters struct {
 	Filters   usagestats.UsageLogFilters
 	StartTime time.Time
 	EndTime   time.Time
+	// Precise is true when start_time/end_time query params drove the range.
+	Precise bool
 }
 
 type userModelStat struct {
@@ -145,27 +147,27 @@ func (h *UsageHandler) parseUserUsageFilters(c *gin.Context, requireRange bool) 
 
 	userTZ := c.Query("timezone")
 	now := timezone.NowInUserLocation(userTZ)
+	parsedRange, err := timezone.ParseQueryTimeRange(
+		c.Query("start_time"),
+		c.Query("end_time"),
+		c.Query("start_date"),
+		c.Query("end_date"),
+		userTZ,
+	)
+	if err != nil {
+		response.BadRequest(c, err.Error())
+		return nil, false
+	}
+
 	var startTime, endTime time.Time
 	var startPtr, endPtr *time.Time
-	startDateStr := strings.TrimSpace(c.Query("start_date"))
-	endDateStr := strings.TrimSpace(c.Query("end_date"))
-
-	if startDateStr != "" {
-		t, err := timezone.ParseInUserLocation("2006-01-02", startDateStr, userTZ)
-		if err != nil {
-			response.BadRequest(c, "Invalid start_date format, use YYYY-MM-DD")
-			return nil, false
-		}
-		startTime = t
+	precise := parsedRange.Precise
+	if parsedRange.Start != nil {
+		startTime = *parsedRange.Start
 		startPtr = &startTime
 	}
-	if endDateStr != "" {
-		t, err := timezone.ParseInUserLocation("2006-01-02", endDateStr, userTZ)
-		if err != nil {
-			response.BadRequest(c, "Invalid end_date format, use YYYY-MM-DD")
-			return nil, false
-		}
-		endTime = t.AddDate(0, 0, 1)
+	if parsedRange.End != nil {
+		endTime = *parsedRange.End
 		endPtr = &endTime
 	}
 
@@ -186,6 +188,10 @@ func (h *UsageHandler) parseUserUsageFilters(c *gin.Context, requireRange bool) 
 		if endPtr == nil {
 			if strings.TrimSpace(c.Query("period")) != "" {
 				endTime = now
+				// period=week/month ends at "now" (precise end bound)
+				if !precise {
+					precise = strings.TrimSpace(c.Query("period")) != ""
+				}
 			} else {
 				endTime = timezone.StartOfDayInUserLocation(now.AddDate(0, 0, 1), userTZ)
 			}
@@ -209,6 +215,7 @@ func (h *UsageHandler) parseUserUsageFilters(c *gin.Context, requireRange bool) 
 		},
 		StartTime: derefTime(startPtr),
 		EndTime:   derefTime(endPtr),
+		Precise:   precise,
 	}, true
 }
 
@@ -274,25 +281,21 @@ func (h *UsageHandler) ListErrors(c *gin.Context) {
 
 	filter := &service.OpsErrorLogFilter{Page: page, PageSize: pageSize}
 
-	// Date range (half-open [start, end)), reuse usage-list semantics.
+	// Date/time range (half-open [start, end)), reuse usage-list semantics.
 	userTZ := c.Query("timezone")
-	if startDateStr := c.Query("start_date"); startDateStr != "" {
-		t, err := timezone.ParseInUserLocation("2006-01-02", startDateStr, userTZ)
-		if err != nil {
-			response.BadRequest(c, "Invalid start_date format, use YYYY-MM-DD")
-			return
-		}
-		filter.StartTime = &t
+	parsedRange, err := timezone.ParseQueryTimeRange(
+		c.Query("start_time"),
+		c.Query("end_time"),
+		c.Query("start_date"),
+		c.Query("end_date"),
+		userTZ,
+	)
+	if err != nil {
+		response.BadRequest(c, err.Error())
+		return
 	}
-	if endDateStr := c.Query("end_date"); endDateStr != "" {
-		t, err := timezone.ParseInUserLocation("2006-01-02", endDateStr, userTZ)
-		if err != nil {
-			response.BadRequest(c, "Invalid end_date format, use YYYY-MM-DD")
-			return
-		}
-		t = t.AddDate(0, 0, 1)
-		filter.EndTime = &t
-	}
+	filter.StartTime = parsedRange.Start
+	filter.EndTime = parsedRange.End
 
 	filter.Model = strings.TrimSpace(c.Query("model"))
 
@@ -468,10 +471,15 @@ func (h *UsageHandler) DashboardTrend(c *gin.Context) {
 		return
 	}
 
+	startDate, endDate, startTime, endTime := timezone.FormatRangeEcho(
+		parsed.StartTime, parsed.EndTime, c.Query("timezone"), parsed.Precise,
+	)
 	response.Success(c, gin.H{
 		"trend":       trend,
-		"start_date":  parsed.StartTime.Format("2006-01-02"),
-		"end_date":    parsed.EndTime.Add(-24 * time.Hour).Format("2006-01-02"),
+		"start_date":  startDate,
+		"end_date":    endDate,
+		"start_time":  startTime,
+		"end_time":    endTime,
 		"granularity": granularity,
 	})
 }
@@ -496,10 +504,15 @@ func (h *UsageHandler) DashboardModels(c *gin.Context) {
 		return
 	}
 
+	startDate, endDate, startTime, endTime := timezone.FormatRangeEcho(
+		parsed.StartTime, parsed.EndTime, c.Query("timezone"), parsed.Precise,
+	)
 	response.Success(c, gin.H{
 		"models":     userModelStatsFromUsageStats(stats),
-		"start_date": parsed.StartTime.Format("2006-01-02"),
-		"end_date":   parsed.EndTime.Add(-24 * time.Hour).Format("2006-01-02"),
+		"start_date": startDate,
+		"end_date":   endDate,
+		"start_time": startTime,
+		"end_time":   endTime,
 	})
 }
 
@@ -528,10 +541,15 @@ func (h *UsageHandler) DashboardSnapshotV2(c *gin.Context) {
 		return
 	}
 
+	startDate, endDate, startTime, endTime := timezone.FormatRangeEcho(
+		parsed.StartTime, parsed.EndTime, c.Query("timezone"), parsed.Precise,
+	)
 	resp := gin.H{
 		"generated_at": time.Now().UTC().Format(time.RFC3339),
-		"start_date":   parsed.StartTime.Format("2006-01-02"),
-		"end_date":     parsed.EndTime.Add(-24 * time.Hour).Format("2006-01-02"),
+		"start_date":   startDate,
+		"end_date":     endDate,
+		"start_time":   startTime,
+		"end_time":     endTime,
 		"granularity":  granularity,
 	}
 

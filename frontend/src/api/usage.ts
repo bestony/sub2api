@@ -58,6 +58,8 @@ export interface UserDashboardStats {
 export interface TrendParams {
   start_date?: string
   end_date?: string
+  start_time?: string
+  end_time?: string
   granularity?: 'day' | 'hour'
   api_key_id?: number
   model?: string

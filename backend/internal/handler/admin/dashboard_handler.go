@@ -31,36 +31,35 @@ func NewDashboardHandler(dashboardService *service.DashboardService, aggregation
 	}
 }
 
-// parseTimeRange parses start_date, end_date query parameters
-// Uses user's timezone if provided, otherwise falls back to server timezone
+// parseTimeRange parses start_time/end_time (RFC3339) or start_date/end_date query parameters.
+// Uses user's timezone if provided, otherwise falls back to server timezone.
+// Invalid precise times fall back to the default last-7-days date window (legacy behavior for dates).
 func parseTimeRange(c *gin.Context) (time.Time, time.Time) {
-	userTZ := c.Query("timezone") // Get user's timezone from request
+	userTZ := c.Query("timezone")
 	now := timezone.NowInUserLocation(userTZ)
-	startDate := c.Query("start_date")
-	endDate := c.Query("end_date")
+	defaultStart := timezone.StartOfDayInUserLocation(now.AddDate(0, 0, -7), userTZ)
+	defaultEnd := timezone.StartOfDayInUserLocation(now.AddDate(0, 0, 1), userTZ)
 
-	var startTime, endTime time.Time
-
-	if startDate != "" {
-		if t, err := timezone.ParseInUserLocation("2006-01-02", startDate, userTZ); err == nil {
-			startTime = t
-		} else {
-			startTime = timezone.StartOfDayInUserLocation(now.AddDate(0, 0, -7), userTZ)
-		}
-	} else {
-		startTime = timezone.StartOfDayInUserLocation(now.AddDate(0, 0, -7), userTZ)
+	parsed, err := timezone.ParseQueryTimeRange(
+		c.Query("start_time"),
+		c.Query("end_time"),
+		c.Query("start_date"),
+		c.Query("end_date"),
+		userTZ,
+	)
+	if err != nil {
+		// Preserve previous date-parse fallback behavior for invalid inputs.
+		return defaultStart, defaultEnd
 	}
 
-	if endDate != "" {
-		if t, err := timezone.ParseInUserLocation("2006-01-02", endDate, userTZ); err == nil {
-			endTime = t.Add(24 * time.Hour) // Include the end date
-		} else {
-			endTime = timezone.StartOfDayInUserLocation(now.AddDate(0, 0, 1), userTZ)
-		}
-	} else {
-		endTime = timezone.StartOfDayInUserLocation(now.AddDate(0, 0, 1), userTZ)
+	startTime := defaultStart
+	endTime := defaultEnd
+	if parsed.Start != nil {
+		startTime = *parsed.Start
 	}
-
+	if parsed.End != nil {
+		endTime = *parsed.End
+	}
 	return startTime, endTime
 }
 

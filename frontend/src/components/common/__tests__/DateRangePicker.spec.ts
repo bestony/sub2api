@@ -78,19 +78,61 @@ describe('DateRangePicker', () => {
     await presetButton!.trigger('click')
     await wrapper.find('.date-picker-apply').trigger('click')
 
-    const nowAfterClick = new Date()
-    const yesterdayAfterClick = new Date(nowAfterClick.getTime() - 24 * 60 * 60 * 1000)
-    const expectedStart = formatLocalDate(yesterdayAfterClick)
-    const expectedEnd = formatLocalDate(nowAfterClick)
+    const change = wrapper.emitted('change')?.[0]?.[0] as {
+      startDate: string
+      endDate: string
+      startTime?: string
+      endTime?: string
+      preset: string | null
+    }
 
-    expect(wrapper.emitted('update:startDate')?.[0]).toEqual([expectedStart])
-    expect(wrapper.emitted('update:endDate')?.[0]).toEqual([expectedEnd])
-    expect(wrapper.emitted('change')?.[0]).toEqual([
-      {
-        startDate: expectedStart,
-        endDate: expectedEnd,
-        preset: 'last24Hours'
+    expect(change.preset).toBe('last24Hours')
+    expect(change.startTime).toBeTruthy()
+    expect(change.endTime).toBeTruthy()
+
+    const startMs = Date.parse(change.startTime!)
+    const endMs = Date.parse(change.endTime!)
+    expect(Number.isFinite(startMs)).toBe(true)
+    expect(Number.isFinite(endMs)).toBe(true)
+    // Rolling 24h window (±2s for test execution skew)
+    expect(Math.abs(endMs - startMs - 24 * 60 * 60 * 1000)).toBeLessThanOrEqual(2000)
+    expect(Math.abs(endMs - Date.now())).toBeLessThanOrEqual(5000)
+
+    expect(wrapper.emitted('update:startDate')?.at(-1)).toEqual([change.startDate])
+    expect(wrapper.emitted('update:endDate')?.at(-1)).toEqual([change.endDate])
+  })
+
+  it('does not emit precise times for day-level presets', async () => {
+    const now = new Date()
+    const today = formatLocalDate(now)
+
+    const wrapper = mount(DateRangePicker, {
+      props: {
+        startDate: today,
+        endDate: today
+      },
+      global: {
+        stubs: {
+          Icon: true
+        }
       }
-    ])
+    })
+
+    await wrapper.find('.date-picker-trigger').trigger('click')
+    const presetButton = wrapper.findAll('.date-picker-preset').find((node) =>
+      node.text().includes('Today')
+    )
+    expect(presetButton).toBeDefined()
+    await presetButton!.trigger('click')
+    await wrapper.find('.date-picker-apply').trigger('click')
+
+    const change = wrapper.emitted('change')?.[0]?.[0] as {
+      startTime?: string
+      endTime?: string
+      preset: string | null
+    }
+    expect(change.preset).toBe('today')
+    expect(change.startTime).toBeUndefined()
+    expect(change.endTime).toBeUndefined()
   })
 })

@@ -80,10 +80,19 @@ import { ref, computed, watch, onMounted, onUnmounted } from 'vue'
 import { useI18n } from 'vue-i18n'
 import Icon from '@/components/icons/Icon.vue'
 
+interface DateRangeResult {
+  start: string
+  end: string
+  /** RFC3339 instant; set for second-precision presets such as last24Hours */
+  startTime?: string
+  /** RFC3339 instant; set for second-precision presets such as last24Hours */
+  endTime?: string
+}
+
 interface DatePreset {
   labelKey: string
   value: string
-  getRange: () => { start: string; end: string }
+  getRange: () => DateRangeResult
 }
 
 interface Props {
@@ -94,7 +103,16 @@ interface Props {
 interface Emits {
   (e: 'update:startDate', value: string): void
   (e: 'update:endDate', value: string): void
-  (e: 'change', range: { startDate: string; endDate: string; preset: string | null }): void
+  (
+    e: 'change',
+    range: {
+      startDate: string
+      endDate: string
+      startTime?: string
+      endTime?: string
+      preset: string | null
+    }
+  ): void
 }
 
 const props = defineProps<Props>()
@@ -160,7 +178,10 @@ const presets: DatePreset[] = [
       const start = new Date(end.getTime() - 24 * 60 * 60 * 1000)
       return {
         start: formatDateToString(start),
-        end: formatDateToString(end)
+        end: formatDateToString(end),
+        // Rolling 24h window with second precision (RFC3339 UTC).
+        startTime: start.toISOString(),
+        endTime: end.toISOString()
       }
     }
   },
@@ -270,9 +291,28 @@ const toggle = () => {
 const apply = () => {
   emit('update:startDate', localStartDate.value)
   emit('update:endDate', localEndDate.value)
+
+  // Recompute precise bounds from the active preset so last24Hours is relative to apply time.
+  let startTime: string | undefined
+  let endTime: string | undefined
+  if (activePreset.value) {
+    const preset = presets.find((p) => p.value === activePreset.value)
+    if (preset) {
+      const range = preset.getRange()
+      localStartDate.value = range.start
+      localEndDate.value = range.end
+      emit('update:startDate', range.start)
+      emit('update:endDate', range.end)
+      startTime = range.startTime
+      endTime = range.endTime
+    }
+  }
+
   emit('change', {
     startDate: localStartDate.value,
     endDate: localEndDate.value,
+    startTime,
+    endTime,
     preset: activePreset.value
   })
   isOpen.value = false

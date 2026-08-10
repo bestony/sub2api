@@ -415,20 +415,47 @@ const formatLocalDate = (date: Date): string => {
   return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`
 }
 
-const getLast24HoursRangeDates = (): { start: string; end: string } => {
+const getLast24HoursRange = (): {
+  start: string
+  end: string
+  startTime: string
+  endTime: string
+} => {
   const end = new Date()
   const start = new Date(end.getTime() - 24 * 60 * 60 * 1000)
   return {
     start: formatLocalDate(start),
-    end: formatLocalDate(end)
+    end: formatLocalDate(end),
+    startTime: start.toISOString(),
+    endTime: end.toISOString(),
   }
 }
 
 // Date range
 const granularity = ref<'day' | 'hour'>('hour')
-const defaultRange = getLast24HoursRangeDates()
+const defaultRange = getLast24HoursRange()
 const startDate = ref(defaultRange.start)
 const endDate = ref(defaultRange.end)
+const startTime = ref<string | undefined>(defaultRange.startTime)
+const endTime = ref<string | undefined>(defaultRange.endTime)
+
+const rangeQueryParams = () => {
+  const hasPrecise = Boolean(startTime.value) && Boolean(endTime.value)
+  if (hasPrecise) {
+    return {
+      start_time: startTime.value,
+      end_time: endTime.value,
+      start_date: undefined as string | undefined,
+      end_date: undefined as string | undefined,
+    }
+  }
+  return {
+    start_date: startDate.value,
+    end_date: endDate.value,
+    start_time: undefined as string | undefined,
+    end_time: undefined as string | undefined,
+  }
+}
 
 // Granularity options for Select component
 const granularityOptions = computed(() => [
@@ -612,13 +639,18 @@ const formatDuration = (ms: number): string => {
 }
 
 const goToUserUsage = (item: UserSpendingRankingItem) => {
+  const query: Record<string, string> = {
+    user_id: String(item.user_id),
+    start_date: startDate.value,
+    end_date: endDate.value,
+  }
+  if (startTime.value && endTime.value) {
+    query.start_time = startTime.value
+    query.end_time = endTime.value
+  }
   void router.push({
     path: '/admin/usage',
-    query: {
-      user_id: String(item.user_id),
-      start_date: startDate.value,
-      end_date: endDate.value
-    }
+    query,
   })
 }
 
@@ -626,18 +658,24 @@ const goToUserUsage = (item: UserSpendingRankingItem) => {
 const onDateRangeChange = (range: {
   startDate: string
   endDate: string
+  startTime?: string
+  endTime?: string
   preset: string | null
 }) => {
-  // Auto-select granularity based on date range
-  const start = new Date(range.startDate)
-  const end = new Date(range.endDate)
-  const daysDiff = Math.ceil((end.getTime() - start.getTime()) / (1000 * 60 * 60 * 24))
+  startDate.value = range.startDate
+  endDate.value = range.endDate
+  const precise = Boolean(range.startTime && range.endTime)
+  startTime.value = precise ? range.startTime : undefined
+  endTime.value = precise ? range.endTime : undefined
 
-  // If range is 1 day, use hourly granularity
-  if (daysDiff <= 1) {
+  // Auto-select granularity based on date range
+  if (precise) {
     granularity.value = 'hour'
   } else {
-    granularity.value = 'day'
+    const start = new Date(range.startDate)
+    const end = new Date(range.endDate)
+    const daysDiff = Math.ceil((end.getTime() - start.getTime()) / (1000 * 60 * 60 * 24))
+    granularity.value = daysDiff <= 1 ? 'hour' : 'day'
   }
 
   loadChartData()
@@ -652,8 +690,7 @@ const loadDashboardSnapshot = async (includeStats: boolean) => {
   chartsLoading.value = true
   try {
     const response = await adminAPI.dashboard.getSnapshotV2({
-      start_date: startDate.value,
-      end_date: endDate.value,
+      ...rangeQueryParams(),
       granularity: granularity.value,
       include_stats: includeStats,
       include_trend: true,
@@ -684,8 +721,7 @@ const loadUsersTrend = async () => {
   userTrendLoading.value = true
   try {
     const response = await adminAPI.dashboard.getUserUsageTrend({
-      start_date: startDate.value,
-      end_date: endDate.value,
+      ...rangeQueryParams(),
       granularity: granularity.value,
       limit: 12
     })
@@ -708,8 +744,7 @@ const loadUserSpendingRanking = async () => {
   rankingError.value = false
   try {
     const response = await adminAPI.dashboard.getUserSpendingRanking({
-      start_date: startDate.value,
-      end_date: endDate.value,
+      ...rangeQueryParams(),
       limit: rankingLimit
     })
     if (currentSeq !== rankingLoadSeq) return
